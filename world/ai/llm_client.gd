@@ -184,7 +184,9 @@ func build_request(system: String, messages: Array, limits: Dictionary = {}) -> 
 		if gemini_model.begins_with("gemini-3") or gemini_model.begins_with("gemini-4"):
 			generation_config.thinkingConfig = {"thinkingLevel": "low"}
 		var gemini_options := {"temperature":"temperature", "top_p":"topP", "top_k":"topK", "seed":"seed"}
+		# Gemini 4 ignores sampling overrides and will reject them in future API versions.
 		for option: String in gemini_options:
+			if gemini_model.begins_with("gemini-4") and option in ["temperature", "top_p", "top_k"]: continue
 			if generation_overrides.has(option): generation_config[gemini_options[option]] = generation_overrides[option]
 		body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
 			"generationConfig": generation_config}
@@ -207,8 +209,11 @@ func build_request(system: String, messages: Array, limits: Dictionary = {}) -> 
 		# max_tokens, so a speech-sized cap cut whole conversations off. Callers without it keep theirs.
 		if limits.has("output_tokens") and int(limits.get("reasoning_room", 0)) > 0:
 			body.max_tokens = output_budget + int(limits.reasoning_room)
-	for key: String in generation_overrides:
-		if key not in ["max_tokens", "timeout"]: body[key] = generation_overrides[key]
+	# OpenAI-compatible overrides belong at the request root; Gemini options
+	# have already been translated into generationConfig above.
+	if provider != "gemini":
+		for key: String in generation_overrides:
+			if key not in ["max_tokens", "timeout"]: body[key] = generation_overrides[key]
 	return {"url": url, "headers": headers, "body": JSON.stringify(body)}
 
 
