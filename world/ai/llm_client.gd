@@ -27,8 +27,8 @@ const EMPTY_CUE := "(No new words were said. Continue naturally, or reply [silen
 ## cut line paid a second full-prompt request (output recovery). The stated budget is unchanged; only
 ## tokens actually generated are billed. An explicit player "Output tokens" override is sent as is.
 const SPEECH_REASONING_ROOM := 1024
-## One chat completion at a time against an OpenAI-compatible endpoint or the Anthropic
-## Messages API. `complete(system, messages, on_done)`; `on_done(text: String, error: String)`.
+## One chat completion at a time against an OpenAI-compatible endpoint, the Anthropic
+## Messages API, or the native Gemini generateContent API.
 
 ## Token counts the provider reported for each finished request (accounting, never content).
 signal usage_reported(usage: Dictionary)
@@ -127,6 +127,10 @@ func build_request(system: String, messages: Array, limits: Dictionary = {}) -> 
 	if limits.has("output_tokens"): generation_budget = output_budget
 	elif provider != "anthropic" and not structured and not limits.get("output_recovery", false) and not generation_overrides.has("max_tokens"):
 		generation_budget = output_budget + SPEECH_REASONING_ROOM
+	# Native Gemini reasoning models count thought tokens inside maxOutputTokens. Keep
+	# the spoken OUTPUT BUDGET small while leaving enough room to reach visible text.
+	if provider == "gemini" and not generation_overrides.has("max_tokens"):
+		generation_budget = maxi(generation_budget, 16384 if limits.get("output_recovery", false) else 8192)
 	system += "\nOUTPUT BUDGET: at most %d tokens including tags. Finish every sentence and tag inside that budget. Prefer a shorter complete answer; omit optional private thoughts and unchanged feelings before sacrificing spoken words." % output_budget
 	if structured and messages.size() > 1:
 		# Plain assistant history trained the model to ignore the JSON contract.
@@ -155,6 +159,35 @@ func build_request(system: String, messages: Array, limits: Dictionary = {}) -> 
 		headers.append("anthropic-version: 2023-06-01")
 		body = {"model": model, "max_tokens": generation_budget,
 			"system": system, "messages": messages}
+	elif provider == "gemini":
+		var endpoint := base_url
+		if not endpoint.ends_with("/v1beta"): endpoint += "/v1beta"
+		var model_id := model.trim_prefix("models/")
+		url = endpoint + "/models/" + model_id.uri_encode() + ":generateContent"
+		if not api_key.is_empty(): headers.append("x-goog-api-key: " + api_key)
+		var contents: Array = []
+		for message: Variant in messages:
+			if not message is Dictionary: continue
+			var content: Variant = message.get("content", "")
+			var text := str(content)
+			if content is Array:
+				var text_parts: PackedStringArray = []
+				for part: Variant in content:
+					if part is Dictionary and part.get("text") is String: text_parts.append(str(part.text))
+				text = "\n".join(text_parts)
+			contents.append({"role": "model" if str(message.get("role", "")) == "assistant" else "user",
+				"parts": [{"text": text}]})
+		var generation_config := {"maxOutputTokens": generation_budget}
+		# Gemini 3+ supports thinkingLevel. Argon defaults to medium, which can spend
+		# the whole output allowance on thoughts before producing visible dialogue.
+		var gemini_model := model_id.to_lower()
+		if gemini_model.begins_with("gemini-3") or gemini_model.begins_with("gemini-4"):
+			generation_config.thinkingConfig = {"thinkingLevel": "low"}
+		var gemini_options := {"temperature":"temperature", "top_p":"topP", "top_k":"topK", "seed":"seed"}
+		for option: String in gemini_options:
+			if generation_overrides.has(option): generation_config[gemini_options[option]] = generation_overrides[option]
+		body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
+			"generationConfig": generation_config}
 	else:
 		url = base_url + "/chat/completions"
 		if api_key != "":
@@ -359,7 +392,9 @@ static func classify(result: int, code: int, headers: PackedStringArray, text: S
 	var parser := JSON.new()
 	if parser.parse(text) != OK or not parser.data is Dictionary:
 		return {"kind": "retry", "error": "malformed reply: " + text.left(120)}
-	if finish_reason(parser.data) in ["refusal", "content_filter"]:
+	if finish_reason(parser.data) in ["refusal", "content_filter", "safety", "prohibited_content", "blocklist",
+		"blocked_reason_unspecified", "recitation", "spii", "escalation", "image_safety",
+		"image_prohibited_content", "image_recitation"]:
 		return {"kind": "refusal", "error": REFUSAL_ERROR, "parsed": parser.data}
 	return {"kind": "ok", "parsed": parser.data}
 
@@ -436,7 +471,20 @@ func _labelled(usage: Dictionary) -> Dictionary:
 
 ## Numeric accounting only: never log prompts, account details, headers or credentials.
 static func usage_counts(parsed: Variant) -> Dictionary:
-	if not parsed is Dictionary or not parsed.get("usage") is Dictionary: return {}
+	if not parsed is Dictionary: return {}
+	if parsed.get("usageMetadata") is Dictionary:
+		var gemini: Dictionary = parsed.usageMetadata
+		var mapped := {}
+		var keys := {"promptTokenCount":"prompt_tokens", "totalTokenCount":"total_tokens", "thoughtsTokenCount":"reasoning_tokens",
+			"cachedContentTokenCount":"cached_tokens"}
+		for source: String in keys:
+			if gemini.get(source) is int or gemini.get(source) is float:
+				mapped[keys[source]] = maxi(0, int(gemini[source]))
+		var visible := maxi(0, int(gemini.get("candidatesTokenCount", 0))) if gemini.get("candidatesTokenCount", 0) is int or gemini.get("candidatesTokenCount", 0) is float else 0
+		var thoughts := int(mapped.get("reasoning_tokens", 0))
+		if visible > 0 or thoughts > 0: mapped.completion_tokens = visible + thoughts
+		return mapped
+	if not parsed.get("usage") is Dictionary: return {}
 	var usage: Dictionary = parsed.usage
 	var result := {}
 	for key: String in ["prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]:
@@ -454,6 +502,10 @@ static func finish_reason(parsed: Variant) -> String:
 	if not parsed is Dictionary: return ""
 	if parsed.get("choices") is Array and not parsed.choices.is_empty() and parsed.choices[0] is Dictionary:
 		return str(parsed.choices[0].get("finish_reason", "")).to_lower()
+	if parsed.get("candidates") is Array and not parsed.candidates.is_empty() and parsed.candidates[0] is Dictionary:
+		return str(parsed.candidates[0].get("finishReason", "")).to_lower()
+	if parsed.get("promptFeedback") is Dictionary:
+		return str(parsed.promptFeedback.get("blockReason", "")).to_lower()
 	return str(parsed.get("stop_reason", "")).to_lower()
 
 
@@ -480,6 +532,15 @@ static func extract_text(parsed: Variant) -> String:
 			if block is Dictionary and block.get("type", "") == "text" and block.get("text") is String:
 				parts.append(str(block.text))
 		return " ".join(parts).strip_edges()
+	if d.get("candidates") is Array and not d.candidates.is_empty() and d.candidates[0] is Dictionary:
+		var content: Variant = d.candidates[0].get("content", {})
+		if not content is Dictionary or not content.get("parts") is Array: return ""
+		var parts: PackedStringArray = []
+		for part: Variant in content.parts:
+			# Thought parts are private chain-of-thought, not the assistant reply.
+			if part is Dictionary and part.get("text") is String and part.get("thought", false) != true:
+				parts.append(str(part.text))
+		return "".join(parts).strip_edges()
 	return ""
 
 

@@ -20,6 +20,8 @@ const PROFILES := preload("res://world/ai/llm_profiles.gd")
 const PRESETS:=[
 	{"name":"Anthropic","provider":"anthropic","base_url":"https://api.anthropic.com/v1","model":"e.g. claude-sonnet-4-5"},
 	{"name":"OpenAI","provider":"openai","base_url":"https://api.openai.com/v1","model":"e.g. gpt-4o-mini"},
+	{"name":"Gemini","provider":"gemini","base_url":"https://generativelanguage.googleapis.com","model":"e.g. gemini-2.5-flash"},
+	{"name":"Smolproxy Gemini","provider":"gemini","base_url":"https://smolproxy.org/google/api","model":"e.g. gemini-4-argon"},
 	{"name":"OpenRouter","provider":"openai","base_url":"https://openrouter.ai/api/v1","model":"e.g. anthropic/claude-sonnet-4.5"},
 	{"name":"Ollama (local)","provider":"openai","base_url":"http://127.0.0.1:11434/v1","model":"e.g. llama3.1:8b (ollama pull it first)"},
 	{"name":"llama.cpp server (local)","provider":"openai","base_url":"http://127.0.0.1:8080/v1","model":"any name; the server uses its loaded model"},
@@ -95,7 +97,7 @@ func setup(surface:Node, in_tab := false)->void:
 	label("Choose your provider, paste your key, then fetch or enter a model.",20)
 	preset_button=button("");preset_button.pressed.connect(cycle_preset)
 	protocol=button("");protocol.pressed.connect(func():
-		provider="anthropic" if provider=="openai" else "openai";_connection_changed();refresh())
+		provider={"openai":"anthropic", "anthropic":"gemini", "gemini":"openai"}.get(provider, "openai");_connection_changed();refresh())
 	field("base_url","Provider base URL","https://your-provider.example/v1")
 	field("api_key","API key","Leave empty for local servers",true)
 	field("model","Model","Model ID from your provider")
@@ -237,7 +239,7 @@ func open()->void:
 	show();refresh();_scroll.scroll_vertical=0;preset_button.grab_focus()
 
 func refresh()->void:
-	protocol.text="Protocol: "+("Anthropic Messages" if provider=="anthropic" else "OpenAI-compatible")
+	protocol.text="Protocol: "+{"anthropic":"Anthropic Messages", "gemini":"Gemini generateContent"}.get(provider, "OpenAI-compatible")
 	preset_button.text="Provider template: "+PRESETS[_preset].name+"  (press to change)"
 	_refresh_profiles()
 	microphone.text="Microphone: "+("System default" if input_device.is_empty() else input_device)
@@ -419,6 +421,8 @@ func test_connection()->void:
 	if str(connection.model).is_empty():test_status.text="Enter the model name first.";panel.refresh();return
 	if is_instance_valid(_tester):_tester.cancel();_tester.queue_free()
 	_tester=LLM.new();_tester.name="ConnectionTest";add_child(_tester)
+	# The native Gemini adapter gives maxOutputTokens enough room for thought tokens
+	# and the visible reply, so reasoning models such as Argon can still reach "OK".
 	connection.max_tokens = 16; connection.timeout = 25.0
 	connection.generation_overrides.erase("max_tokens"); connection.generation_overrides.erase("timeout")
 	_tester.configure(connection)

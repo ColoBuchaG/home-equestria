@@ -15,7 +15,7 @@ const MOD_PROMPTS := "user://mods/prompts"
 
 const DEFAULTS := {
 	"llm": {
-		"provider": "openai",           # "openai" (any OpenAI-compatible endpoint) or "anthropic"
+		"provider": "openai",           # "openai" compatible, "anthropic", or native "gemini"
 		"base_url": "",
 		"api_key": "",
 		"model": "",
@@ -170,7 +170,7 @@ static func save_connection(connection:Dictionary,input_device:String,path:=USER
 static func validate_llm(connection: Dictionary) -> String:
 	var options_error := OPTIONS.validate(connection.get("generation_overrides", {}))
 	if not options_error.is_empty(): return options_error
-	if connection.get("provider") not in ["openai", "anthropic"]: return "Choose a provider protocol."
+	if connection.get("provider") not in ["openai", "anthropic", "gemini"]: return "Choose a provider protocol."
 	for key in ["base_url", "model", "api_key"]:
 		if not connection.get(key, "") is String: return "Dialogue fields must be text."
 	if not valid_url(str(connection.get("base_url", "")).strip_edges().rstrip("/")):
